@@ -1,6 +1,5 @@
 """
 API de Monitoramento com FastAPI + Evolution API
-Arquivo: monitor_api.py
 """
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -13,13 +12,11 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Monitor JulgadosBR", version="1.0.0")
 
-# Configurações Evolution API
 EVOLUTION_API_URL = os.getenv("WHATSAPP_API_URL", "")
 EVOLUTION_INSTANCE = os.getenv("WHATSAPP_INSTANCE", "monitor-julgados-2")
 EVOLUTION_API_KEY = os.getenv("WHATSAPP_API_KEY", "")
 WHATSAPP_PHONE = os.getenv("WHATSAPP_PHONE", "")
 
-# Serviços a monitorar - AJUSTE AS URLs
 SERVICES = {
     "frontend_dev": {
         "name": "Frontend Dev",
@@ -50,13 +47,16 @@ class ServiceStatus(BaseModel):
     error_message: str = ""
 
 async def check_service(service_id: str, config: dict) -> dict:
-    """Verifica o status de um serviço"""
+    """Verifica o status de um serviço com logs detalhados"""
     start_time = datetime.now()
     
     try:
         async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             response = await client.get(config["url"])
             response_time = (datetime.now() - start_time).total_seconds()
+            
+            # Log detalhado do status HTTP
+            print(f"  └─ HTTP {response.status_code} em {response_time:.2f}s")
             
             if response.status_code == 200:
                 return {
@@ -65,31 +65,46 @@ async def check_service(service_id: str, config: dict) -> dict:
                     "error_message": ""
                 }
             else:
+                error_msg = f"HTTP {response.status_code}"
+                # Tenta pegar mais detalhes da resposta
+                try:
+                    body = response.text[:200]  # Primeiros 200 chars
+                    if body:
+                        print(f"  └─ Resposta: {body}")
+                except:
+                    pass
+                
                 return {
                     "status": "error",
                     "response_time": response_time,
-                    "error_message": f"HTTP {response.status_code}"
+                    "error_message": error_msg
                 }
+                
     except httpx.TimeoutException:
         response_time = (datetime.now() - start_time).total_seconds()
+        print(f"  └─ ⏱️ Timeout após {response_time:.2f}s")
         return {
             "status": "offline",
             "response_time": response_time,
-            "error_message": "Timeout - Serviço não respondeu"
+            "error_message": "Timeout - Serviço não respondeu em 10s"
         }
-    except httpx.ConnectError:
+        
+    except httpx.ConnectError as e:
         response_time = (datetime.now() - start_time).total_seconds()
+        print(f"  └─ 🔌 Erro de conexão: {str(e)[:100]}")
         return {
             "status": "offline",
             "response_time": response_time,
-            "error_message": "Erro de conexão - Serviço offline"
+            "error_message": "Erro de conexão - Serviço inacessível"
         }
+        
     except Exception as e:
         response_time = (datetime.now() - start_time).total_seconds()
+        print(f"  └─ ❌ Erro inesperado: {str(e)[:100]}")
         return {
             "status": "offline",
             "response_time": response_time,
-            "error_message": f"Erro: {str(e)}"
+            "error_message": f"Erro: {str(e)[:100]}"
         }
 
 async def send_whatsapp_evolution(message: str) -> bool:
@@ -131,7 +146,13 @@ async def send_whatsapp_evolution(message: str) -> bool:
 async def send_whatsapp_alert(service_name: str, status: str, error: str = ""):
     """Formata e envia alerta via WhatsApp"""
     
-    emoji = "🔴" if status == "offline" else "⚠️" if status == "error" else "✅"
+    if status == "offline":
+        emoji = "🔴"
+    elif status == "error":
+        emoji = "⚠️"
+    else:
+        emoji = "✅"
+    
     timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     
     message = f"""{emoji} *Alerta JulgadosBR*
@@ -147,8 +168,9 @@ async def send_whatsapp_alert(service_name: str, status: str, error: str = ""):
 
 async def monitor_service(service_id: str, config: dict):
     """Loop de monitoramento de um serviço"""
-    previous_status = "online"
+    previous_status = None  # Começa como None para detectar primeiro estado
     consecutive_failures = 0
+    alert_sent = False  # Flag para evitar spam de alertas
     
     print(f"🔍 Iniciando monitoramento: {config['name']} ({config['url']})")
     
@@ -170,27 +192,30 @@ async def monitor_service(service_id: str, config: dict):
         status_emoji = "✅" if current_status == "online" else "❌"
         print(f"{status_emoji} {config['name']}: {current_status} ({result['response_time']:.2f}s)")
         
-        # Detecta mudança de status
+        # LÓGICA DE ALERTAS CORRIGIDA
         if current_status != "online":
             consecutive_failures += 1
             
             # Envia alerta após 2 falhas consecutivas (reduz falsos positivos)
-            if consecutive_failures == 2 and previous_status == "online":
+            if consecutive_failures >= 2 and not alert_sent:
                 print(f"🚨 ALERTA: {config['name']} está {current_status}!")
                 await send_whatsapp_alert(
                     config["name"],
                     current_status,
                     result["error_message"]
                 )
+                alert_sent = True
         else:
-            # Serviço voltou
-            if previous_status != "online" and consecutive_failures >= 2:
+            # Serviço voltou ao normal
+            if alert_sent:  # Só envia recuperação se tinha enviado alerta antes
                 print(f"✅ RECUPERADO: {config['name']} voltou ao ar!")
                 await send_whatsapp_alert(
                     config["name"],
                     "online",
                     "Serviço recuperado ✅"
                 )
+                alert_sent = False
+            
             consecutive_failures = 0
         
         previous_status = current_status
@@ -215,7 +240,7 @@ async def startup_event():
     await send_whatsapp_evolution(
         f"🚀 *Monitor JulgadosBR Iniciado*\n\n"
         f"Monitorando {len(SERVICES)} serviços.\n"
-        f"Você receberá alertas caso algo fique offline."
+        f"Você receberá alertas após 2 falhas consecutivas."
     )
 
 @app.get("/")
